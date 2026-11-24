@@ -1,0 +1,24 @@
+{
+  "command": "powershell.exe",
+  "args": [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    "launch.ps1"
+  ],
+  "restart_policy": "always",
+  "display_name": "Quota Capsule",
+  "description": "Injects a live quota capsule into the Antigravity 2.0 composer bar (between Model and Turbo) and provides a settings & diagnostics side pane.",
+  "has_web_ui": true,
+  "ui_config": {
+    "display_name": "Quota Capsule",
+    "views": [
+      {
+        "title": "Quota Capsule",
+        "path": "/aux-pane.html",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE"
+      }
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "antigravity-quota-capsule",
+  "displayName": "Antigravity Quota Capsule",
+  "version": "1.0.0",
+  "description": "Displays live Gemini & Claude/GPT quota rings directly inside the Antigravity 2.0 composer bar between the Model Selector and Turbo mode button (Windows-native plugin).",
+  "author": {
+    "name": "ztailang21",
+    "url": "https://github.com/ztailang21"
+  },
+  "homepage": "https://github.com/ztailang21/antigravity-quota-capsule",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ztailang21/antigravity-quota-capsule"
+  },
+  "suggestedPrompts": [
+    "帮我检查 Antigravity Quota Capsule 插件的连接状态和当前额度",
+    "打开 Quota Capsule 设置面板"
+  ]
+}
