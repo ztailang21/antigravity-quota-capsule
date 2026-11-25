@@ -1,6 +1,6 @@
-/* Antigravity Quota Capsule v1.1.0 — Injected Composer Widget (Shadow DOM + Portal Popover) */
+/* Antigravity Quota Capsule v1.1.1 — Injected Composer Widget (Shadow DOM + Portal Popover) */
 (() => {
-  const VERSION = "1.1.0";
+  const VERSION = "1.1.1";
 
   // Clean up any prior injection cleanly (idempotent hot-reload safe)
   if (typeof window.__agQuotaCapsuleCleanup === "function") {
@@ -407,7 +407,9 @@
     const q = state.quota;
     const dataReady = hasAnyData(q);
 
-    // Graceful responsive layout: even if user picked "both", protect composer toolbar if window is very narrow
+    // Graceful responsive layout:
+    // - "auto": adapts across both / active / compact based on true Model-to-Turbo pixel distance
+    // - "both": ALWAYS keeps both Gemini & Claude/GPT visible (uses compact labels when space is tight)
     let mode = state.config.density || "auto";
     let compactBothLabels = false;
     if (mode === "auto") {
@@ -415,12 +417,10 @@
       else if (state.slotWidth >= 155) mode = "active";
       else mode = "compact";
     } else if (mode === "both") {
-      if (state.slotWidth < 195) {
-        mode = state.slotWidth >= 135 ? "active" : "compact";
-      } else if (state.slotWidth < 280) {
+      if (state.slotWidth < 275) {
         compactBothLabels = true;
       }
-    } else if (mode === "active" && state.slotWidth < 125) {
+    } else if (mode === "active" && state.slotWidth < 120) {
       mode = "compact";
     }
 
@@ -819,7 +819,7 @@
       return;
     }
 
-    const { toolbar, leftChild, rightChild, modelBtn } = found;
+    const { toolbar, rightChild, modelBtn, modeBtn } = found;
     const prevModel = state.activeModelName;
     state.activeModelName = modelBtn.label;
     state.activeGroup = classifyModelGroup(modelBtn.label);
@@ -829,7 +829,8 @@
       if (resizeObserver) resizeObserver.disconnect();
       if (typeof ResizeObserver === "function") {
         resizeObserver = new ResizeObserver(() => {
-          if (measureSlotWidth(leftChild, rightChild)) {
+          const latest = findComposerControls();
+          if (latest && measureSlotWidth(latest.modelBtn.el, latest.modeBtn.el)) {
             renderPill();
             if (state.popoverOpen) positionPopover();
           }
@@ -838,7 +839,7 @@
       }
     }
 
-    const changedWidth = measureSlotWidth(leftChild, rightChild);
+    const changedWidth = measureSlotWidth(modelBtn.el, modeBtn.el);
     if (changedWidth || prevModel !== state.activeModelName || !pillShadow.innerHTML) {
       renderPill();
     }
@@ -846,11 +847,15 @@
     reportMountStatus(true, prevModel !== state.activeModelName);
   }
 
-  function measureSlotWidth(leftChild, rightChild) {
-    if (!leftChild || !rightChild) return false;
-    const lr = leftChild.getBoundingClientRect();
-    const rr = rightChild.getBoundingClientRect();
-    const gap = Math.max(54, Math.floor(rr.left - lr.right - 14));
+  /**
+   * Measures the TRUE pixel distance between the right edge of the Model Selector button
+   * and the left edge of the Mode/Turbo button (immune to flex-grow wrapper containers).
+   */
+  function measureSlotWidth(modelBtnEl, modeBtnEl) {
+    if (!modelBtnEl || !modeBtnEl) return false;
+    const mr = modelBtnEl.getBoundingClientRect();
+    const tr = modeBtnEl.getBoundingClientRect();
+    const gap = Math.max(54, Math.floor(tr.left - mr.right - 16));
     if (Math.abs(gap - state.slotWidth) >= 6) {
       state.slotWidth = gap;
       return true;

@@ -22,7 +22,7 @@ const rootDir = dirname(__dirname);
 async function testManifests() {
   const pluginJson = JSON.parse(readFileSync(join(rootDir, "plugin.json"), "utf8"));
   assert.equal(pluginJson.name, "antigravity-quota-capsule");
-  assert.equal(pluginJson.version, "1.1.0");
+  assert.equal(pluginJson.version, "1.1.1");
   assert.ok(pluginJson.displayName);
 
   const sidecarJson = JSON.parse(
@@ -230,7 +230,7 @@ async function testSidecarHttpApiAndSecurity() {
     assert.equal(htmlRes.status, 200);
     assert.equal(htmlRes.headers.get("x-content-type-options"), "nosniff");
     const html = await htmlRes.text();
-    assert.ok(html.includes("v1.1.0"));
+    assert.ok(html.includes("v1.1.1"));
 
     // Verify cross-origin CSRF rejection on POST /api/config
     const csrfBlocked = await fetch(`http://127.0.0.1:${port}/api/config`, {

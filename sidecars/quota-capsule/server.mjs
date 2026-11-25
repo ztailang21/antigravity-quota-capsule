@@ -470,7 +470,7 @@ export function createSidecarApp(options = {}) {
 if (process.argv[1] && fileURLToPath(import.meta.url).toLowerCase() === resolve(process.argv[1]).toLowerCase()) {
   const app = createSidecarApp();
   app.start().then((boundPort) => {
-    console.error(`[antigravity-quota-capsule v1.1.0] Sidecar listening on http://127.0.0.1:${boundPort}`);
+    console.error(`[antigravity-quota-capsule v1.1.1] Sidecar listening on http://127.0.0.1:${boundPort}`);
   });
 
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
