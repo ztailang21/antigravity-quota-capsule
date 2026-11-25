@@ -1,4 +1,4 @@
-// Zero-dependency Windows DevToolsActivePort discovery & RFC6455 loopback CDP bridge
+// Zero-dependency Windows DevToolsActivePort discovery & RFC6455 loopback CDP bridge (v1.1.0)
 
 import { randomBytes, createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
@@ -9,6 +9,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const MAX_WS_BUFFER_BYTES = 8 * 1024 * 1024; // 8 MiB hard safety cap
 
 /**
  * Minimal, standards-compliant RFC6455 WebSocket client for 127.0.0.1 CDP targets.
@@ -23,6 +24,7 @@ export class LoopbackWebSocket extends EventEmitter {
     this.closed = false;
     this.buffer = Buffer.alloc(0);
     this.fragmentChunks = [];
+    this.fragmentBytes = 0;
     this.fragmentOpcode = 0;
   }
 
@@ -49,6 +51,7 @@ export class LoopbackWebSocket extends EventEmitter {
       }, timeoutMs);
 
       const sock = net.createConnection({ host: "127.0.0.1", port });
+      sock.setNoDelay(true);
       this.socket = sock;
 
       sock.once("connect", () => {
@@ -65,7 +68,12 @@ export class LoopbackWebSocket extends EventEmitter {
       });
 
       sock.on("data", (chunk) => {
-        this.buffer = Buffer.concat([this.buffer, chunk]);
+        if (this.buffer.length + chunk.length > MAX_WS_BUFFER_BYTES) {
+          this.close();
+          return;
+        }
+        this.buffer = this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk]);
+
         if (!this.handshakeDone) {
           const headerEnd = this.buffer.indexOf("\r\n\r\n");
           if (headerEnd === -1) return;
@@ -169,8 +177,18 @@ export class LoopbackWebSocket extends EventEmitter {
         offset = 4;
       } else if (payloadLen === 127) {
         if (this.buffer.length < 10) return;
-        payloadLen = Number(this.buffer.readBigUInt64BE(2));
+        const bigLen = this.buffer.readBigUInt64BE(2);
+        if (bigLen > BigInt(MAX_WS_BUFFER_BYTES)) {
+          this.close();
+          return;
+        }
+        payloadLen = Number(bigLen);
         offset = 10;
+      }
+
+      if (payloadLen > MAX_WS_BUFFER_BYTES) {
+        this.close();
+        return;
       }
 
       const maskBytes = isMasked ? 4 : 0;
@@ -184,32 +202,45 @@ export class LoopbackWebSocket extends EventEmitter {
           unmasked[i] = payload[i] ^ mask[i & 3];
         }
         payload = unmasked;
+      } else {
+        // Copy out slice so the underlying receive buffer can be GC'd promptly
+        payload = Buffer.from(payload);
       }
-      this.buffer = this.buffer.subarray(offset + maskBytes + payloadLen);
+      this.buffer =
+        this.buffer.length === offset + maskBytes + payloadLen
+          ? Buffer.alloc(0)
+          : this.buffer.subarray(offset + maskBytes + payloadLen);
 
       if (opcode === 0x8) {
         this.close();
         return;
       }
       if (opcode === 0x9) {
-        this._writeFrame(0xA, payload);
+        this._writeFrame(0x0a, payload);
         continue;
       }
-      if (opcode === 0xA) {
+      if (opcode === 0x0a) {
         continue;
       }
 
       if (opcode === 0x0) {
+        this.fragmentBytes += payload.length;
+        if (this.fragmentBytes > MAX_WS_BUFFER_BYTES) {
+          this.close();
+          return;
+        }
         this.fragmentChunks.push(payload);
         if (fin && this.fragmentOpcode === 0x1) {
           const msg = Buffer.concat(this.fragmentChunks).toString("utf8");
           this.fragmentChunks = [];
+          this.fragmentBytes = 0;
           this.fragmentOpcode = 0;
           this.emit("message", msg);
         }
       } else if (!fin) {
         this.fragmentOpcode = opcode;
         this.fragmentChunks = [payload];
+        this.fragmentBytes = payload.length;
       } else if (opcode === 0x1) {
         this.emit("message", payload.toString("utf8"));
       }
@@ -219,6 +250,9 @@ export class LoopbackWebSocket extends EventEmitter {
   close() {
     if (this.closed) return;
     this.closed = true;
+    this.buffer = Buffer.alloc(0);
+    this.fragmentChunks = [];
+    this.fragmentBytes = 0;
     try {
       this.socket?.destroy();
     } catch {
@@ -248,7 +282,6 @@ export function getCandidateDevToolsPortFiles() {
     join(home, ".config", "Antigravity", "DevToolsActivePort")
   );
 
-  // Deduplicate while keeping order
   return [...new Set(candidates)];
 }
 
@@ -268,15 +301,14 @@ export function discoverDebugEndpoints() {
       // ignore unreadable candidate
     }
   }
-  // Prefer most recently updated DevToolsActivePort
   found.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
-  // Optional explicit env port or standard 9222 fallback
   const envPort = Number.parseInt(process.env.ANTIGRAVITY_CDP_PORT || "", 10);
   if (envPort > 0 && envPort < 65536 && !found.some((f) => f.port === envPort)) {
     found.push({ port: envPort, filePath: "ENV:ANTIGRAVITY_CDP_PORT", mtimeMs: 0 });
   }
-  if (!found.some((f) => f.port === 9222)) {
+  // Only probe fallback:9222 if no DevToolsActivePort file was found
+  if (found.length === 0) {
     found.push({ port: 9222, filePath: "fallback:9222", mtimeMs: 0 });
   }
   return found;
@@ -294,6 +326,9 @@ function httpGetJson(port, path, timeoutMs = 1500) {
       res.setEncoding("utf8");
       res.on("data", (c) => {
         data += c;
+        if (data.length > 2 * 1024 * 1024) {
+          req.destroy(new Error("JSON list too large"));
+        }
       });
       res.on("end", () => {
         try {
@@ -317,7 +352,8 @@ function isAntigravityRendererTarget(target) {
   if (url.startsWith("devtools://") || url.startsWith("chrome-extension://") || url === "about:blank") {
     return false;
   }
-  // Reject obvious non-Antigravity local web pages if user happens to have port 9222 open elsewhere
+  // Never inject into our own Aux Pane iframe if listed as a target
+  if (url.includes("/aux-pane.html")) return false;
   if (/antigravity|agy/i.test(title) || /antigravity|index\.html|file:\/\/|app:\/\/|vscode-file/i.test(url)) {
     return true;
   }
@@ -329,13 +365,15 @@ function isAntigravityRendererTarget(target) {
  * injects the Shadow DOM composer widget, and relays bidirectional events.
  */
 export class CdpBridge extends EventEmitter {
-  constructor(widgetScriptProvider) {
+  constructor(widgetScriptProvider, options = {}) {
     super();
     this.widgetScriptProvider = widgetScriptProvider;
-    this.sessions = new Map(); // targetId -> { ws, idSeq, pending, target }
+    this.sessions = new Map();
     this.pollTimer = null;
+    this.pollingInFlight = false;
     this.stopped = false;
     this.latestStatePayload = null;
+    this.networkCaptureEnabled = options.enableNetworkCapture !== false;
     this.status = {
       connected: false,
       port: 0,
@@ -349,14 +387,13 @@ export class CdpBridge extends EventEmitter {
 
   start() {
     this.stopped = false;
-    this._poll();
-    this.pollTimer = setInterval(() => this._poll(), 3000);
+    this._scheduleNextPoll(50);
   }
 
   stop() {
     this.stopped = true;
     if (this.pollTimer) {
-      clearInterval(this.pollTimer);
+      clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
     for (const s of this.sessions.values()) {
@@ -364,6 +401,28 @@ export class CdpBridge extends EventEmitter {
     }
     this.sessions.clear();
     this._refreshStatus();
+  }
+
+  /**
+   * Dynamically enables or disables CDP Network response buffering.
+   * Disabling Network capture when Sidecar NativeRPC is active avoids Chromium DevTools memory overhead.
+   */
+  setNetworkCaptureEnabled(enabled) {
+    const next = Boolean(enabled);
+    if (this.networkCaptureEnabled === next) return;
+    this.networkCaptureEnabled = next;
+    for (const session of this.sessions.values()) {
+      if (next) {
+        this._sendCdp(session, "Network.enable", {
+          maxPostDataSize: 0,
+          maxResourceBufferSize: 262144,
+          maxTotalBufferSize: 524288,
+        }).catch(() => {});
+      } else {
+        session.quotaRequests.clear();
+        this._sendCdp(session, "Network.disable", {}).catch(() => {});
+      }
+    }
   }
 
   setStatePayload(payload) {
@@ -383,52 +442,72 @@ export class CdpBridge extends EventEmitter {
     }
   }
 
-  async _poll() {
+  _scheduleNextPoll(delayMs) {
     if (this.stopped) return;
-    const candidates = discoverDebugEndpoints();
-    let matchedEndpoint = null;
-    let rendererTargets = [];
+    if (this.pollTimer) clearTimeout(this.pollTimer);
+    this.pollTimer = setTimeout(async () => {
+      await this._poll();
+      // Adaptive backoff: 2.5s while searching for Antigravity, 18s once connected (to detect extra windows)
+      const nextDelay = this.sessions.size > 0 ? 18000 : 2500;
+      this._scheduleNextPoll(nextDelay);
+    }, delayMs);
+  }
 
-    for (const ep of candidates) {
-      try {
-        const list = await httpGetJson(ep.port, "/json/list", 1200);
-        if (!Array.isArray(list)) continue;
-        const pages = list.filter(isAntigravityRendererTarget);
-        if (pages.length > 0) {
-          matchedEndpoint = ep;
-          rendererTargets = pages;
-          break;
+  async _poll() {
+    if (this.stopped || this.pollingInFlight) return;
+    this.pollingInFlight = true;
+    try {
+      const candidates = discoverDebugEndpoints();
+      let matchedEndpoint = null;
+      let rendererTargets = [];
+
+      for (const ep of candidates) {
+        try {
+          const list = await httpGetJson(ep.port, "/json/list", 1200);
+          if (!Array.isArray(list)) continue;
+          const pages = list.filter(isAntigravityRendererTarget);
+          if (pages.length > 0) {
+            matchedEndpoint = ep;
+            rendererTargets = pages;
+            break;
+          }
+        } catch {
+          // port not listening or stale DevToolsActivePort
         }
-      } catch {
-        // port not listening or stale DevToolsActivePort
       }
-    }
 
-    if (!matchedEndpoint) {
-      if (this.sessions.size === 0) {
-        this.status.connected = false;
-        this.status.port = 0;
-        this.status.portFile = "";
-        this.status.targetCount = 0;
-        this.status.targets = [];
-        this.status.lastError =
-          "未检测到 Antigravity CDP 调试端口。请确认已运行 install.ps1 并通过更新后的快捷方式重启 Antigravity。";
+      if (!matchedEndpoint) {
+        if (this.sessions.size === 0) {
+          this.status.connected = false;
+          this.status.port = 0;
+          this.status.portFile = "";
+          this.status.targetCount = 0;
+          this.status.targets = [];
+          this.status.lastError =
+            "未检测到 Antigravity CDP 调试端口。请确认已运行 install.ps1 并通过更新后的快捷方式重启 Antigravity。";
+        }
+        return;
       }
-      return;
+
+      this.status.port = matchedEndpoint.port;
+      this.status.portFile = matchedEndpoint.filePath;
+      this.status.lastError = "";
+
+      for (const target of rendererTargets) {
+        if (this.sessions.has(target.id)) {
+          // Keep cached title fresh
+          this.sessions.get(target.id).target = target;
+          continue;
+        }
+        await this._attachTarget(target).catch((err) => {
+          this.status.lastError = `CDP attach error: ${err.message}`;
+        });
+      }
+
+      this._refreshStatus();
+    } finally {
+      this.pollingInFlight = false;
     }
-
-    this.status.port = matchedEndpoint.port;
-    this.status.portFile = matchedEndpoint.filePath;
-    this.status.lastError = "";
-
-    for (const target of rendererTargets) {
-      if (this.sessions.has(target.id)) continue;
-      await this._attachTarget(target).catch((err) => {
-        this.status.lastError = `CDP attach error: ${err.message}`;
-      });
-    }
-
-    this._refreshStatus();
   }
 
   async _attachTarget(target) {
@@ -440,7 +519,7 @@ export class CdpBridge extends EventEmitter {
       target,
       idSeq: 1,
       pending: new Map(),
-      quotaRequests: new Map(), // requestId -> url (only quota-related endpoints)
+      quotaRequests: new Map(),
     };
     this.sessions.set(target.id, session);
 
@@ -465,8 +544,7 @@ export class CdpBridge extends EventEmitter {
           return;
         }
 
-        // Passive native quota observer: strictly matches quota/user-status JSON responses only
-        if (msg.method === "Network.responseReceived") {
+        if (this.networkCaptureEnabled && msg.method === "Network.responseReceived") {
           const reqId = msg.params?.requestId;
           const url = String(msg.params?.response?.url || "");
           const status = Number(msg.params?.response?.status || 0);
@@ -474,10 +552,10 @@ export class CdpBridge extends EventEmitter {
             reqId &&
             status >= 200 &&
             status < 300 &&
-            /(GetUserStatus|RetrieveUserQuotaSummary|GetCommandModelConfigs|UserQuota|QuotaSummary|quota)/i.test(url)
+            /(GetUserStatus|RetrieveUserQuotaSummary|GetCommandModelConfigs|UserQuota|QuotaSummary)/i.test(url)
           ) {
             session.quotaRequests.set(reqId, url);
-            if (session.quotaRequests.size > 30) {
+            if (session.quotaRequests.size > 24) {
               const firstKey = session.quotaRequests.keys().next().value;
               session.quotaRequests.delete(firstKey);
             }
@@ -485,7 +563,7 @@ export class CdpBridge extends EventEmitter {
           return;
         }
 
-        if (msg.method === "Network.loadingFinished") {
+        if (this.networkCaptureEnabled && msg.method === "Network.loadingFinished") {
           const reqId = msg.params?.requestId;
           if (reqId && session.quotaRequests.has(reqId)) {
             const url = session.quotaRequests.get(reqId);
@@ -513,6 +591,10 @@ export class CdpBridge extends EventEmitter {
       session.quotaRequests.clear();
       this.sessions.delete(target.id);
       this._refreshStatus();
+      // If last window closed or reloaded, wake up fast reconnect polling immediately
+      if (this.sessions.size === 0 && !this.stopped) {
+        this._scheduleNextPoll(800);
+      }
     });
 
     ws.on("error", () => {
@@ -521,7 +603,13 @@ export class CdpBridge extends EventEmitter {
 
     await this._sendCdp(session, "Runtime.enable", {});
     await this._sendCdp(session, "Page.enable", {});
-    await this._sendCdp(session, "Network.enable", {}).catch(() => {});
+    if (this.networkCaptureEnabled) {
+      await this._sendCdp(session, "Network.enable", {
+        maxPostDataSize: 0,
+        maxResourceBufferSize: 262144,
+        maxTotalBufferSize: 524288,
+      }).catch(() => {});
+    }
     await this._sendCdp(session, "Runtime.addBinding", { name: "__agQuotaCapsuleEmit" });
 
     const script = this.widgetScriptProvider();

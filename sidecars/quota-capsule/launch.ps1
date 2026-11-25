@@ -1,5 +1,5 @@
 ﻿#requires -Version 5.1
-# Unicode-safe Windows launcher for Antigravity Quota Capsule sidecar.
+# Unicode-safe Windows launcher for Antigravity Quota Capsule sidecar (v1.1.0).
 # Bypasses cmd.exe / agy-node.cmd CP936 encoding issues on non-ASCII Windows usernames (e.g. C:\Users\中文\).
 
 $ErrorActionPreference = 'Stop'
@@ -13,14 +13,28 @@ if ($nodeCmd -and (Test-Path $nodeCmd.Source)) {
     exit $LASTEXITCODE
 }
 
-# 2. Fallback to Antigravity's bundled Electron runtime in Node mode (zero external Node.js needed)
-$candidates = @(
-    (Join-Path $env:LOCALAPPDATA 'Programs\antigravity\Antigravity.exe'),
-    (Join-Path $env:LOCALAPPDATA 'Programs\Google Antigravity\Antigravity.exe'),
-    (Join-Path $env:ProgramFiles 'Antigravity\Antigravity.exe')
-)
+# 2. Fallback to Antigravity's bundled Electron runtime in Node mode (checks standard paths + parent process path)
+$candidates = New-Object System.Collections.Generic.List[string]
+try {
+    $selfProc = Get-CimInstance Win32_Process -Filter "ProcessId = $PID" -ErrorAction SilentlyContinue
+    if ($selfProc -and $selfProc.ParentProcessId) {
+        $parent = Get-Process -Id $selfProc.ParentProcessId -ErrorAction SilentlyContinue
+        if ($parent -and $parent.Path -and (Test-Path $parent.Path)) {
+            $parentDir = Split-Path -Parent $parent.Path
+            $candidates.Add((Join-Path $parentDir 'Antigravity.exe'))
+            if ($parent.ProcessName -match '^Antigravity$') {
+                $candidates.Add($parent.Path)
+            }
+        }
+    }
+} catch {
+}
 
-foreach ($exe in $candidates) {
+$candidates.Add((Join-Path $env:LOCALAPPDATA 'Programs\antigravity\Antigravity.exe'))
+$candidates.Add((Join-Path $env:LOCALAPPDATA 'Programs\Google Antigravity\Antigravity.exe'))
+$candidates.Add((Join-Path $env:ProgramFiles 'Antigravity\Antigravity.exe'))
+
+foreach ($exe in ($candidates | Select-Object -Unique)) {
     if ($exe -and (Test-Path $exe)) {
         $env:ELECTRON_RUN_AS_NODE = '1'
         & $exe $ServerScript

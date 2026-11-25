@@ -1,7 +1,7 @@
-// Antigravity Quota Capsule Sidecar Server (Zero-dependency Node ESM)
+// Antigravity Quota Capsule Sidecar Server v1.1.0 (Zero-dependency Node ESM)
 // Launched & managed automatically by Antigravity 2.0 via sidecar.json
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { CdpBridge } from "./cdp-bridge.mjs";
 import { fetchFromSidecarLsEnv, parseNativeQuotaPayload } from "./native-quota-sync.mjs";
 import {
+  countValidMetrics,
   createEmptySnapshot,
   createSampleQuota,
   hasAnyQuotaData,
@@ -51,6 +52,21 @@ function defaultConfig() {
   };
 }
 
+function quotaFingerprint(q) {
+  if (!q) return "";
+  return [
+    q.geminiWeekly?.remainingPercent,
+    q.geminiWeekly?.resetAtMs,
+    q.geminiFiveHour?.remainingPercent,
+    q.geminiFiveHour?.resetAtMs,
+    q.claudeGptWeekly?.remainingPercent,
+    q.claudeGptWeekly?.resetAtMs,
+    q.claudeGptFiveHour?.remainingPercent,
+    q.claudeGptFiveHour?.resetAtMs,
+    q.source,
+  ].join("|");
+}
+
 function loadPersistedState(stateFile) {
   try {
     if (existsSync(stateFile)) {
@@ -70,25 +86,47 @@ function loadPersistedState(stateFile) {
   };
 }
 
-function savePersistedState(stateFile, state) {
+/**
+ * Atomic write via temp file + rename to prevent JSON corruption on abrupt power loss / taskkill.
+ */
+function savePersistedStateAtomic(stateFile, state) {
   try {
-    writeFileSync(stateFile, JSON.stringify({ config: state.config, quota: state.quota }, null, 2), "utf8");
+    const tmpFile = `${stateFile}.tmp`;
+    const json = JSON.stringify({ config: state.config, quota: state.quota }, null, 2);
+    writeFileSync(tmpFile, json, "utf8");
+    renameSync(tmpFile, stateFile);
   } catch {
-    // ignore write errors
+    try {
+      writeFileSync(stateFile, JSON.stringify({ config: state.config, quota: state.quota }, null, 2), "utf8");
+    } catch {
+      // ignore write errors
+    }
   }
+}
+
+function isLoopbackHostHeader(hostHeader) {
+  if (!hostHeader) return true;
+  return /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(String(hostHeader).trim());
+}
+
+function isAllowedOrigin(originHeader) {
+  if (!originHeader || originHeader === "null") return true;
+  return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(String(originHeader).trim());
 }
 
 export function createSidecarApp(options = {}) {
   const dataDir = resolveDataDir(options.dataDir);
   const stateFile = join(dataDir, "state.json");
   const persisted = loadPersistedState(stateFile);
+  const hasLsEnvInit = Boolean(process.env.ANTIGRAVITY_LS_ADDRESS && process.env.ANTIGRAVITY_CSRF_TOKEN);
+
   const state = {
     config: persisted.config,
     quota: persisted.quota,
     activeModelName: "",
     activeGroup: "unknown",
     nativeSync: {
-      hasLsEnv: Boolean(process.env.ANTIGRAVITY_LS_ADDRESS && process.env.ANTIGRAVITY_CSRF_TOKEN),
+      hasLsEnv: hasLsEnvInit,
       envKeyNames: Object.keys(process.env).filter((k) => /^ANTIGRAVITY_/i.test(k)),
       lastNativeSyncAtMs: 0,
       lastNativeSource: "",
@@ -103,6 +141,10 @@ export function createSidecarApp(options = {}) {
   };
 
   let nativePollTimer = null;
+  let resetExpiryTimer = null;
+  let pollInFlight = null;
+  let lastDiskSaveMs = 0;
+  let lastSavedFingerprint = quotaFingerprint(state.quota);
 
   const widgetScriptPath = join(__dirname, "injected-widget.js");
   const auxPanePath = join(__dirname, "aux-pane.html");
@@ -120,41 +162,90 @@ export function createSidecarApp(options = {}) {
     serverTimeMs: Date.now(),
   });
 
+  // Schedule an exact wakeup poll right after the soonest quota window resets!
+  const scheduleNextResetWakeup = () => {
+    if (resetExpiryTimer) {
+      clearTimeout(resetExpiryTimer);
+      resetExpiryTimer = null;
+    }
+    if (options.disableNativePoll) return;
+
+    const now = Date.now();
+    const candidates = [
+      state.quota.geminiWeekly?.resetAtMs,
+      state.quota.geminiFiveHour?.resetAtMs,
+      state.quota.claudeGptWeekly?.resetAtMs,
+      state.quota.claudeGptFiveHour?.resetAtMs,
+    ].filter((ms) => typeof ms === "number" && ms > now);
+
+    if (candidates.length === 0) return;
+    const soonestMs = Math.min(...candidates);
+    const delayMs = Math.min(2147483000, Math.max(2500, soonestMs - now + 2500));
+    resetExpiryTimer = setTimeout(() => {
+      pollNativeLs();
+    }, delayMs);
+  };
+
   const applyFreshQuota = (parsed, sourceLabel) => {
     if (!parsed || !hasAnyQuotaData(parsed)) return false;
-    state.quota = mergeQuotaSnapshots(state.quota, { ...parsed, source: sourceLabel || parsed.source || "Native" });
+    const merged = mergeQuotaSnapshots(state.quota, { ...parsed, source: sourceLabel || parsed.source || "Native" });
+    const nextFp = quotaFingerprint(merged);
+    const dataChanged = nextFp !== lastSavedFingerprint;
+
+    state.quota = merged;
     state.widgetStatus.syncMessage = "";
     if (state.config.demoMode) {
       state.config.demoMode = false;
     }
-    savePersistedState(stateFile, state);
+
+    const now = Date.now();
+    if (dataChanged || now - lastDiskSaveMs > 5 * 60 * 1000) {
+      lastSavedFingerprint = nextFp;
+      lastDiskSaveMs = now;
+      savePersistedStateAtomic(stateFile, state);
+    }
+
+    scheduleNextResetWakeup();
     if (bridge) bridge.setStatePayload(buildPayload());
     return true;
   };
 
   const pollNativeLs = async () => {
     if (options.disableNativePoll) return false;
-    try {
-      const res = await fetchFromSidecarLsEnv();
-      state.nativeSync.hasLsEnv = res.available;
-      if (res.endpointsTried.length > 0) {
-        state.nativeSync.endpointsTried = res.endpointsTried;
+    if (pollInFlight) return pollInFlight;
+
+    pollInFlight = (async () => {
+      try {
+        const res = await fetchFromSidecarLsEnv();
+        state.nativeSync.hasLsEnv = res.available;
+        if (res.endpointsTried.length > 0) {
+          state.nativeSync.endpointsTried = res.endpointsTried;
+        }
+        if (res.snapshot && hasAnyQuotaData(res.snapshot)) {
+          state.nativeSync.lastNativeSyncAtMs = Date.now();
+          state.nativeSync.lastNativeSource = "NativeRPC";
+          // Disable unnecessary CDP Network buffering once NativeRPC resolves all 4 metrics!
+          if (bridge && countValidMetrics(res.snapshot) >= 4) {
+            bridge.setNetworkCaptureEnabled(false);
+          }
+          return applyFreshQuota(res.snapshot, "NativeRPC");
+        }
+      } catch {
+        // ignore transient poll error
+      } finally {
+        pollInFlight = null;
       }
-      if (res.snapshot && hasAnyQuotaData(res.snapshot)) {
-        state.nativeSync.lastNativeSyncAtMs = Date.now();
-        state.nativeSync.lastNativeSource = "NativeRPC";
-        return applyFreshQuota(res.snapshot, "NativeRPC");
-      }
-    } catch {
-      // ignore transient poll error
-    }
-    return false;
+      return false;
+    })();
+
+    return pollInFlight;
   };
 
-  const bridge =
-    options.disableCdp
-      ? null
-      : new CdpBridge(() => readFileSync(widgetScriptPath, "utf8"));
+  const bridge = options.disableCdp
+    ? null
+    : new CdpBridge(() => readFileSync(widgetScriptPath, "utf8"), {
+        enableNetworkCapture: !hasLsEnvInit,
+      });
 
   if (bridge) {
     bridge.on("nativeQuotaPayload", (jsonPayload, url) => {
@@ -171,10 +262,20 @@ export function createSidecarApp(options = {}) {
       state.widgetStatus.lastEventAtMs = Date.now();
 
       if (msg.type === "mountStatus") {
+        const prevModel = state.activeModelName;
         state.widgetStatus.mounted = Boolean(msg.mounted);
         state.widgetStatus.slotWidth = Number(msg.slotWidth) || 0;
         if (typeof msg.activeModelName === "string") state.activeModelName = msg.activeModelName;
         if (typeof msg.activeGroup === "string") state.activeGroup = msg.activeGroup;
+        // Refresh native quota promptly if user switched models and last poll was >15s ago
+        if (
+          prevModel &&
+          state.activeModelName &&
+          prevModel !== state.activeModelName &&
+          Date.now() - state.nativeSync.lastNativeSyncAtMs > 15000
+        ) {
+          pollNativeLs();
+        }
         return;
       }
 
@@ -236,12 +337,23 @@ export function createSidecarApp(options = {}) {
     res.writeHead(code, {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
     });
     res.end(data);
   };
 
   const server = http.createServer(async (req, res) => {
     try {
+      // Protect against DNS rebinding and cross-origin browser CSRF
+      if (!isLoopbackHostHeader(req.headers.host)) {
+        sendJson(res, 403, { ok: false, error: "Forbidden Host header" });
+        return;
+      }
+      if (req.method === "POST" && !isAllowedOrigin(req.headers.origin)) {
+        sendJson(res, 403, { ok: false, error: "Forbidden Origin header" });
+        return;
+      }
+
       const url = new URL(req.url || "/", "http://127.0.0.1");
       const pathname = url.pathname;
 
@@ -250,6 +362,7 @@ export function createSidecarApp(options = {}) {
         res.writeHead(200, {
           "Content-Type": "text/html; charset=utf-8",
           "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
         });
         res.end(html);
         return;
@@ -268,7 +381,7 @@ export function createSidecarApp(options = {}) {
             state.config[k] = patch[k];
           }
         }
-        savePersistedState(stateFile, state);
+        savePersistedStateAtomic(stateFile, state);
         if (bridge) bridge.setStatePayload(buildPayload());
         sendJson(res, 200, buildPayload());
         return;
@@ -319,12 +432,17 @@ export function createSidecarApp(options = {}) {
       return new Promise((resolve) => {
         server.listen(port, "127.0.0.1", () => {
           const addr = server.address();
+          scheduleNextResetWakeup();
           if (bridge) {
             bridge.setStatePayload(buildPayload());
             bridge.start();
           }
           if (!options.disableNativePoll) {
-            pollNativeLs();
+            pollNativeLs().then((ok) => {
+              if (!ok && bridge) {
+                bridge.setNetworkCaptureEnabled(true);
+              }
+            });
             nativePollTimer = setInterval(() => {
               pollNativeLs();
             }, 45000);
@@ -338,6 +456,10 @@ export function createSidecarApp(options = {}) {
         clearInterval(nativePollTimer);
         nativePollTimer = null;
       }
+      if (resetExpiryTimer) {
+        clearTimeout(resetExpiryTimer);
+        resetExpiryTimer = null;
+      }
       if (bridge) bridge.stop();
       server.close();
     },
@@ -348,7 +470,7 @@ export function createSidecarApp(options = {}) {
 if (process.argv[1] && fileURLToPath(import.meta.url).toLowerCase() === resolve(process.argv[1]).toLowerCase()) {
   const app = createSidecarApp();
   app.start().then((boundPort) => {
-    console.error(`[antigravity-quota-capsule] Sidecar listening on http://127.0.0.1:${boundPort}`);
+    console.error(`[antigravity-quota-capsule v1.1.0] Sidecar listening on http://127.0.0.1:${boundPort}`);
   });
 
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {

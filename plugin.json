@@ -1,7 +1,7 @@
 {
   "name": "antigravity-quota-capsule",
   "displayName": "Antigravity Quota Capsule",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Displays live Gemini & Claude/GPT quota rings directly inside the Antigravity 2.0 composer bar between the Model Selector and Turbo mode button (Windows-native plugin).",
   "author": {
     "name": "ztailang21",

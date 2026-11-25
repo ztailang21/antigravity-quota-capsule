@@ -1,21 +1,26 @@
-// Native-grade automatic quota synchronization for Antigravity 2.0
+// Native-grade automatic quota synchronization for Antigravity 2.0 (v1.1.0)
 // Supports:
 //  1) Official Sidecar env Connect-RPC (ANTIGRAVITY_LS_ADDRESS + ANTIGRAVITY_CSRF_TOKEN)
+//     with protocol caching & early-exit once all 4 metrics are resolved
 //  2) Universal recursive JSON extractor for GetUserStatus / GetCommandModelConfigs / RetrieveUserQuotaSummary
 
 import http from "node:http";
 import https from "node:https";
 import {
+  countValidMetrics,
   createEmptySnapshot,
   hasAnyQuotaData,
   isValidMetric,
   mergeQuotaSnapshots,
 } from "./quota-parser.mjs";
 
-const GEMINI_RE = /\b(gemini|neon|flash|google)\b|gemini/i;
+const GEMINI_RE = /\b(gemini|neon|carbon|hydrogen|argon|helium|lithium|flash|google)\b|gemini/i;
 const CLAUDE_GPT_RE = /\b(claude|gpt|opus|sonnet|haiku|o1|o3|o4|chatgpt|openai|anthropic|third[_ -]?party)\b/i;
 const WEEKLY_RE = /(week|weekly|7d|168h|604800)/i;
 const FIVE_HOUR_RE = /(5h|5[_ -]?hour|five[_ -]?hour|session|short|18000)/i;
+
+// Cache preferred TLS mode per LS address to avoid redundant failed socket attempts every poll
+const preferredTlsByAddress = new Map();
 
 function parseTimestampMs(val) {
   if (!val) return 0;
@@ -57,7 +62,6 @@ function parsePercentValue(obj) {
     }
   }
 
-  // Some responses report usedFraction / usageFraction instead of remainingFraction
   const usedFracKeys = ["usedFraction", "used_fraction", "usageFraction"];
   for (const k of usedFracKeys) {
     if (typeof obj[k] === "number" && Number.isFinite(obj[k])) {
@@ -67,7 +71,7 @@ function parsePercentValue(obj) {
     }
   }
 
-  // If resetTime exists inside a quotaInfo object without remainingFraction, Antigravity omits 0.0 (proto3 default)!
+  // Proto3 omits numeric 0.0 fields on the wire; if resetTime is present in a quota object, remaining is 0%!
   if (obj.resetTime || obj.reset_time || obj.resetTimestamp || obj.reset_timestamp) {
     return 0;
   }
@@ -84,7 +88,6 @@ function classifyWindow(obj, hintText, resetAtMs, nowMs) {
   if (durSec >= 86400) return "weekly";
   if (durSec > 0 && durSec <= 43200) return "fiveHour";
 
-  // Infer from resetTime distance: 5-hour windows reset within <= 6 hours, weekly windows reset > 6 hours out
   if (resetAtMs > nowMs) {
     const diffHours = (resetAtMs - nowMs) / 3600000;
     if (diffHours > 6.5) return "weekly";
@@ -114,7 +117,6 @@ function assignMetric(snap, family, winType, pct, resetAtMs) {
         : "claudeGptFiveHour";
 
   const existing = snap[targetKey];
-  // If multiple models share a pool, take the most constrained (lowest remaining %) or fill unset slot
   if (!isValidMetric(existing) || pct < existing.remainingPercent || (!existing.resetAtMs && resetAtMs > 0)) {
     snap[targetKey] = {
       remainingPercent: pct,
@@ -124,15 +126,11 @@ function assignMetric(snap, family, winType, pct, resetAtMs) {
   }
 }
 
-/**
- * Parses native JSON payloads from GetUserStatus, GetCommandModelConfigs,
- * RetrieveUserQuotaSummary, or similar Antigravity Connect-RPC / Cloud Code responses.
- */
 export function parseNativeQuotaPayload(payload, nowMs = Date.now()) {
   const snap = createEmptySnapshot();
   if (!payload || typeof payload !== "object") return snap;
 
-  // 1. Structured path: userStatus.cascadeModelConfigData.clientModelConfigs[] (or top-level clientModelConfigs)
+  // 1. Structured path: userStatus.cascadeModelConfigData.clientModelConfigs[]
   const modelConfigs =
     payload?.userStatus?.cascadeModelConfigData?.clientModelConfigs ||
     payload?.cascadeModelConfigData?.clientModelConfigs ||
@@ -157,7 +155,6 @@ export function parseNativeQuotaPayload(payload, nowMs = Date.now()) {
       const family = classifyFamily(label);
       if (family === "unknown") continue;
 
-      // Single quotaInfo object
       if (cfg.quotaInfo && typeof cfg.quotaInfo === "object") {
         const qi = cfg.quotaInfo;
         const resetAtMs = parseTimestampMs(qi.resetTime || qi.reset_time || qi.resetTimestamp);
@@ -166,7 +163,6 @@ export function parseNativeQuotaPayload(payload, nowMs = Date.now()) {
         assignMetric(snap, family, winType, pct, resetAtMs);
       }
 
-      // Explicit nested weekly / five-hour quota objects if present
       if (cfg.weeklyQuotaInfo && typeof cfg.weeklyQuotaInfo === "object") {
         const wq = cfg.weeklyQuotaInfo;
         assignMetric(
@@ -203,7 +199,6 @@ export function parseNativeQuotaPayload(payload, nowMs = Date.now()) {
       return;
     }
 
-    // Check if this object carries a model family identifier
     const localLabels = [
       node.groupName,
       node.poolName,
@@ -225,7 +220,6 @@ export function parseNativeQuotaPayload(payload, nowMs = Date.now()) {
 
     const hint = `${inheritedHint} ${localLabels}`.trim();
 
-    // Check if this node itself is a quota metric leaf
     const hasQuotaFields =
       node.remainingFraction !== undefined ||
       node.remaining_fraction !== undefined ||
@@ -245,7 +239,6 @@ export function parseNativeQuotaPayload(payload, nowMs = Date.now()) {
       assignMetric(snap, family, winType, pct, resetAtMs);
     }
 
-    // Recurse into child properties, passing property key as semantic hint (e.g. "weeklyQuota", "geminiModels")
     for (const [key, val] of Object.entries(node)) {
       if (!val || typeof val !== "object") continue;
       const keyFamily = classifyFamily(key);
@@ -295,6 +288,9 @@ function postConnectRpc(address, csrfToken, rpcPath, bodyObj, useTls = false, ti
         res.setEncoding("utf8");
         res.on("data", (chunk) => {
           data += chunk;
+          if (data.length > 4 * 1024 * 1024) {
+            req.destroy(new Error("RPC response exceeded 4MB cap"));
+          }
         });
         res.on("end", () => {
           if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
@@ -317,10 +313,6 @@ function postConnectRpc(address, csrfToken, rpcPath, bodyObj, useTls = false, ti
   });
 }
 
-/**
- * Polls official Antigravity Sidecar Connect-RPC environment variables (when provided by host)
- * without ever scanning external processes or probing undocumented ports.
- */
 export async function fetchFromSidecarLsEnv() {
   const address = process.env.ANTIGRAVITY_LS_ADDRESS || "";
   const csrf = process.env.ANTIGRAVITY_CSRF_TOKEN || "";
@@ -340,23 +332,32 @@ export async function fetchFromSidecarLsEnv() {
     },
   ];
 
+  const cachedTls = preferredTlsByAddress.get(address);
+  const tlsOrder =
+    cachedTls === true ? [true, false] : cachedTls === false ? [false, true] : /^https:/i.test(address) ? [true, false] : [false, true];
+
   let combined = createEmptySnapshot();
   const endpointsTried = [];
 
   for (const ep of endpoints) {
-    for (const useTls of [false, true]) {
+    for (const useTls of tlsOrder) {
       try {
         const json = await postConnectRpc(address, csrf, ep.path, ep.body, useTls, 2200);
+        preferredTlsByAddress.set(address, useTls);
         const parsed = parseNativeQuotaPayload(json, Date.now());
-        endpointsTried.push(`${ep.path} (${useTls ? "https" : "http"}): ok`);
+        endpointsTried.push(`${ep.path.split("/").pop()} (${useTls ? "https" : "http"}): ok`);
         if (hasAnyQuotaData(parsed)) {
           combined = mergeQuotaSnapshots(combined, parsed);
           combined.source = "NativeRPC";
         }
         break;
       } catch {
-        // try next protocol / endpoint
+        // try alternate protocol or next endpoint
       }
+    }
+    // Early-exit once all 4 quota metrics (Gemini W+5h & Claude/GPT W+5h) are resolved
+    if (countValidMetrics(combined) >= 4) {
+      break;
     }
   }
 

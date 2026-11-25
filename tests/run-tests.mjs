@@ -22,6 +22,7 @@ const rootDir = dirname(__dirname);
 async function testManifests() {
   const pluginJson = JSON.parse(readFileSync(join(rootDir, "plugin.json"), "utf8"));
   assert.equal(pluginJson.name, "antigravity-quota-capsule");
+  assert.equal(pluginJson.version, "1.1.0");
   assert.ok(pluginJson.displayName);
 
   const sidecarJson = JSON.parse(
@@ -31,13 +32,12 @@ async function testManifests() {
   assert.ok(sidecarJson.args.includes("launch.ps1"));
   assert.equal(sidecarJson.has_web_ui, true);
   assert.equal(sidecarJson.ui_config.views[0].entrypoint, "SIDECAR_UI_ENTRYPOINT_AUX_PANE");
-  console.log("[PASS] Manifest schema validation (plugin.json + sidecar.json)");
+  console.log("[PASS] Manifest schema validation (plugin.json v1.1.0 + sidecar.json)");
 }
 
 async function testQuotaParser() {
   const t0 = Date.UTC(2026, 10, 24, 12, 0, 0);
 
-  // 1. Exact Image 1 Chinese layout (column-grouped DOM order)
   const zhCols = [
     "Gemini 模型",
     "周限额",
@@ -63,7 +63,6 @@ async function testQuotaParser() {
   assert.equal(formatShortReset(s1.geminiFiveHour, t0 + 30 * 60000, true), "1h15m");
   assert.equal(formatShortReset(s1.geminiFiveHour, t0 + 3 * 3600000, true), "已重置");
 
-  // 2. English layout
   const enRows = [
     "Gemini models",
     "Weekly limit",
@@ -87,7 +86,6 @@ async function testQuotaParser() {
   assert.equal(s2.claudeGptFiveHour.remainingPercent, 95);
   assert.equal(formatFullReset(s2.claudeGptFiveHour, t0, false), "Resets in 45m");
 
-  // 3. Partial merge preserves existing metrics
   const partial = parseQuotaLines(["Gemini 模型", "5 小时限额", "55% 剩余", "1 小时 20 分钟 后重置"], t0 + 60000);
   const merged = mergeQuotaSnapshots(s1, partial);
   assert.equal(merged.geminiFiveHour.remainingPercent, 55);
@@ -95,6 +93,54 @@ async function testQuotaParser() {
   assert.equal(merged.claudeGptFiveHour.remainingPercent, 100);
 
   console.log("[PASS] QuotaParser ZH/EN + countdown + partial merge");
+}
+
+async function testNativeQuotaPayloadParser() {
+  const now = Date.UTC(2026, 10, 24, 12, 0, 0);
+  // Test Carbon/Hydrogen naming without explicit "Gemini" prefix + proto3 omitted 0%
+  const sampleRpc = {
+    userStatus: {
+      cascadeModelConfigData: {
+        clientModelConfigs: [
+          {
+            label: "Carbon High",
+            quotaInfo: {
+              remainingFraction: 0.62,
+              resetTime: new Date(now + 105 * 60000).toISOString(),
+            },
+            weeklyQuotaInfo: {
+              remainingFraction: 0.5,
+              resetTime: new Date(now + (5 * 24 + 14) * 3600000).toISOString(),
+            },
+          },
+          {
+            label: "Hydrogen",
+            quotaInfo: {
+              remainingFraction: 0.93,
+              resetTime: new Date(now + 120 * 60000).toISOString(),
+            },
+          },
+          {
+            label: "Claude Sonnet 4.5",
+            quotaInfo: {
+              remainingFraction: 1.0,
+              resetTime: new Date(now + 299 * 60000).toISOString(),
+            },
+            weeklyQuotaInfo: {
+              resetTime: new Date(now + (3 * 24 + 14) * 3600000).toISOString(),
+            },
+          },
+        ],
+      },
+    },
+  };
+
+  const parsed = parseNativeQuotaPayload(sampleRpc, now);
+  assert.equal(parsed.geminiWeekly.remainingPercent, 50);
+  assert.equal(parsed.geminiFiveHour.remainingPercent, 62); // most constrained across Carbon/Hydrogen pool
+  assert.equal(parsed.claudeGptWeekly.remainingPercent, 0);
+  assert.equal(parsed.claudeGptFiveHour.remainingPercent, 100);
+  console.log("[PASS] Native Connect-RPC parser (Carbon/Hydrogen + proto3 0% + pool min)");
 }
 
 async function testLoopbackWebSocket() {
@@ -130,7 +176,6 @@ async function testLoopbackWebSocket() {
     );
 
     socket.on("data", (buf) => {
-      // Unmask single-frame client message and echo back a medium (>126 bytes) JSON response
       const b1 = buf[1];
       let len = b1 & 0x7f;
       let off = 2;
@@ -172,47 +217,7 @@ async function testLoopbackWebSocket() {
   console.log("[PASS] Pure-JS RFC6455 LoopbackWebSocket client");
 }
 
-async function testNativeQuotaPayloadParser() {
-  const now = Date.UTC(2026, 10, 24, 12, 0, 0);
-  const sampleRpc = {
-    userStatus: {
-      cascadeModelConfigData: {
-        clientModelConfigs: [
-          {
-            label: "Gemini 4 Neon High",
-            quotaInfo: {
-              remainingFraction: 0.62,
-              resetTime: new Date(now + 105 * 60000).toISOString(),
-            },
-            weeklyQuotaInfo: {
-              remainingFraction: 0.83,
-              resetTime: new Date(now + (6 * 24 + 15) * 3600000).toISOString(),
-            },
-          },
-          {
-            label: "Claude Sonnet 4.5",
-            quotaInfo: {
-              remainingFraction: 1.0,
-              resetTime: new Date(now + 299 * 60000).toISOString(),
-            },
-            weeklyQuotaInfo: {
-              resetTime: new Date(now + (3 * 24 + 14) * 3600000).toISOString(),
-            },
-          },
-        ],
-      },
-    },
-  };
-
-  const parsed = parseNativeQuotaPayload(sampleRpc, now);
-  assert.equal(parsed.geminiWeekly.remainingPercent, 83);
-  assert.equal(parsed.geminiFiveHour.remainingPercent, 62);
-  assert.equal(parsed.claudeGptWeekly.remainingPercent, 0);
-  assert.equal(parsed.claudeGptFiveHour.remainingPercent, 100);
-  console.log("[PASS] Native Connect-RPC / CDP JSON quota parser (all 4 metrics incl. proto3 0%)");
-}
-
-async function testSidecarHttpApi() {
+async function testSidecarHttpApiAndSecurity() {
   const tmpData = mkdtempSync(join(tmpdir(), "ag-quota-test-"));
   const app = createSidecarApp({ disableCdp: true, disableNativePoll: true, dataDir: tmpData });
   const port = await app.start(0);
@@ -223,8 +228,40 @@ async function testSidecarHttpApi() {
 
     const htmlRes = await fetch(`http://127.0.0.1:${port}/aux-pane.html`);
     assert.equal(htmlRes.status, 200);
+    assert.equal(htmlRes.headers.get("x-content-type-options"), "nosniff");
     const html = await htmlRes.text();
-    assert.ok(html.includes("Antigravity Quota Capsule"));
+    assert.ok(html.includes("v1.1.0"));
+
+    // Verify cross-origin CSRF rejection on POST /api/config
+    const csrfBlocked = await fetch(`http://127.0.0.1:${port}/api/config`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "https://evil.example.com",
+      },
+      body: JSON.stringify({ enabled: false }),
+    });
+    assert.equal(csrfBlocked.status, 403);
+
+    // Verify DNS rebinding Host header rejection
+    const dnsRebindStatus = await new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          host: "127.0.0.1",
+          port,
+          path: "/api/state",
+          method: "GET",
+          headers: { Host: "attacker.example.com" },
+        },
+        (res) => {
+          res.resume();
+          resolve(res.statusCode);
+        }
+      );
+      req.on("error", reject);
+      req.end();
+    });
+    assert.equal(dnsRebindStatus, 403);
 
     const ingestRes = await fetch(`http://127.0.0.1:${port}/api/ingest-lines`, {
       method: "POST",
@@ -254,7 +291,7 @@ async function testSidecarHttpApi() {
     assert.equal(cfgRes.config.density, "both");
     assert.equal(cfgRes.config.openOnHover, true);
 
-    console.log("[PASS] Sidecar HTTP server & Aux Pane API (isolated temp dataDir)");
+    console.log("[PASS] Sidecar HTTP API + CSRF/DNS-rebinding security + atomic persistence");
   } finally {
     app.stop();
     rmSync(tmpData, { recursive: true, force: true });
@@ -265,5 +302,5 @@ await testManifests();
 await testQuotaParser();
 await testNativeQuotaPayloadParser();
 await testLoopbackWebSocket();
-await testSidecarHttpApi();
-console.log("\nALL ANTIGRAVITY QUOTA CAPSULE PLUGIN TESTS PASSED!");
+await testSidecarHttpApiAndSecurity();
+console.log("\nALL ANTIGRAVITY QUOTA CAPSULE v1.1.0 TESTS PASSED!");
